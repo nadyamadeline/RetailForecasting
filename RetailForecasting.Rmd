@@ -1,0 +1,623 @@
+---
+title: 
+author: 
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: simplex 
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning=FALSE)
+library(tidyverse)
+library(dplyr)
+library(feasts)
+library(tsibble)
+library(tsibbledata)
+library(fable)
+library(kableExtra)
+library(lubridate)
+```
+
+```{r}
+set.seed(28856112, sample.kind="Rounding")
+myseries <- aus_retail %>%
+  filter(
+    `Series ID` == sample(aus_retail$`Series ID`,1),
+    Month < yearmonth("2018 Jan")
+  )
+
+data <- myseries %>% select(-State,-Industry,-`Series ID`)
+```
+
+<h1 align="center"> Retail Turnover Analysis </h1> 
+<center>by Nadya Afandi 28856112 </center>
+
+<hr>
+
+
+## 1. STATISTICAL FEATURES
+
+
+```{r}
+data %>% autoplot(Turnover)+
+  xlab("Month")+
+  ylab("Turnover")+
+  ggtitle("Retail Turnover Time-Series")
+```
+
+This is a data on the Retail Turnover of Western Australia's Hardware, Building, and Garden Supplies Industry from the period of April 1982 to December 2017.
+
+Plotted above is the monthly time-series of the Retail Turnover, where we can see an overall upward trend, with an obvious downfall peaking at around the year 2010, before it eventually started to increase again going along the end of the period.
+
+The amount of variation, from visual inspection, is roughly constant for the first one-third of the data, with larger increasing variation happening as the time-series goes on.
+
+The time-series is not stationary as the data is clearly trended and it does not have constant mean and variance.
+
+<hr>
+
+## 2. DATA TRANSFORMATION & DIFFERENCING
+
+
+```{r}
+# Obtaining optimal lambda value 
+lambda_opt <- data %>%
+  features(Turnover, features=guerrero)
+lambda_opt <- lambda_opt$lambda_guerrero
+
+# Do Box-Cox Transformation and Plot
+data <- data %>% mutate(BC_Turnover=box_cox(Turnover,lambda_opt))
+data %>% autoplot(BC_Turnover)+
+  xlab("Month")+
+  ylab("Turnover")+
+  ggtitle("Box-Cox Transformed Turnover Time-Series")
+```
+
+First, we do a Box-Cox transformation on the Turnover to stabilise the variation in the time-series. To do this, we first need to find the optimal lambda value that best stabilise our data. After doing so, we would then use this value to do the Box-Cox transformation of the Turnover data.
+
+As seen from the plot above and comparing it with the previous original plot, we can see that the variation within the data is now more constant and stable.
+
+
+```{r}
+# Checking stationarity and correlation in the data
+data %>% gg_tsdisplay(box_cox(Turnover,lambda_opt),lag_max=36)
+
+
+# Conducting unit-root test
+kpss <- data %>% features(box_cox(Turnover,lambda_opt),unitroot_kpss) %>% select(kpss_stat,kpss_pval)
+
+kable(kpss)
+```
+
+<br>
+
+Here, we check the stationarity and correlation of the transformed data, and we can clearly see that this time-series is not stationary, given the ACF and PACF plot.
+
+The ACF plot shows the correlation in the data for the period $y_{t}$ up to $y_{t-k}$, while the PACF plot shows the correlation in the data for the period $y_t$ and $y_{t-k}$. If there are bars that exceed the blue-dashed line, we can say that autocorrelation exists in the data. 
+
+From the ACF plot, we can see that the time-series decay very slowly, showing that the time-series is persistent and thus implying it is non-stationary. As seen from the PACF plot, there are obvious spikes at lag 1, 13, and 25, showing that there is autocorrelation.
+
+These having said, we can say that there is autocorrelation in our time-series, and hence concluding that even our Box-Cox transformed time-series is non-stationary. Therefore, as we want to have a stationary time-series, we might need to set up an appropriate differencing.
+
+To do this, we need to do the KPSS unit-root test.
+
+<br>
+
+Conducting a hypothesis test with:
+
+$H_0:$ The data are stationary and non-seasonal
+
+$H_1:$ The data are non-stationary and seasonal
+
+Decision rule: Reject $H_0$ if the p-value is less than the $\alpha$ significant level.
+
+In this case, setting $\alpha=0.05$, we can reject the null hypothesis as p-value (0.01) < $\alpha$ (0.05). Thus, we can say that our data is non-stationary and seasonal.
+
+This gave us more evidence that we need to do differencing on our data, testing for both ordinary differencing and seasonal differencing. Ordinary differences are the change between one observation and the next, while seasonal differences are the change between one season to the next.
+
+<br>
+
+To determine these order of differencing needed,
+
+
+```{r}
+# Determining order of differencing 
+# Ordinary
+ndiff <- unitroot_ndiffs(data$BC_Turnover)
+
+# Seasonal
+nsdiff <- unitroot_nsdiffs(data$BC_Turnover,.period=12)
+
+differences <- as.table(cbind(ndiff,nsdiff))
+
+kable(differences) 
+```
+
+Given the values reported in the table above, we need to do both first-order ordinary and seasonal differencing.
+
+<hr>
+
+## 3. METHODOLOGY & MODEL SELECTION CRITERIA
+
+
+In order to determine which forecasting model works best for our data, we first need to have a better idea on how each time-series component of the data looks like. To do this, we can take a look at the STL decomposition plot.
+
+```{r}
+# Looking at the data STL decomposition
+data_dcmp <- data %>% STL(Turnover)
+data_dcmp %>% autoplot(Turnover) + ggtitle("STL Decomposition Plot")
+data_dcmp %>% gg_subseries(Turnover) + ggtitle("Seasonality Plot")
+```
+
+
+STL stands for "Seasonal and Trend decomposition using Loess". Consequently, from the STL plot we can observe seasonal pattern and trend pattern individually, along with the remainder (error) pattern as well.
+
+In this case, we can see that there is obvious trend in the data. It has an overall increasing trend, with a downturn occuring around the year 2007 and hit rock bottom around the year 2010; before it started to increase again. The overall trend prior to the year 2007 increase at an approximately constant rate, while after year 2010 it increases at a constant to a slight decreasing rate. This having said, by visual inspection, we can guess that the data will have an additive or additive-damped trend. 
+
+On the other hand, the magnitude of seasonal fluctuation varies as the time-series progress. It started on at a constant rate until the year 1995, where it then started to increase significantly. As a result, we can say that seasonality are proportional to level of the series; concluding that a multiplicative seasonal model would be appropriate for this data.
+
+Lastly, as the remainder term is also proportional to level of series (it increases as time goes on), we can also say that the time-series have a multiplicative error term. 
+
+With all these information and assumption in hand, we can start building our models.
+
+
+### ETS
+```{r}
+# Find the best ETS model (Training)
+ets_best <- data %>% model(ETS=ETS(Turnover))
+report(ets_best)
+```
+
+First, we will begin by using an ETS model for our data. ETS stands for Exponential Smoothing; where the E denotes the error (remainder) model, T for trend model, and S for seasonality model.
+
+Here, R reported that an ETS(M,A,M) model would best suit our data. This means that using a multiplicative error, additive trend, and multiplicative seasonality model would help us obtain the best forecast for our data. Great! This is consistent with our previous assumption based on STL plot visual inspection.
+
+To check if this model is indeed the best for our data, we will have other ETS models and compare their respective AICc.
+
+AICc is the Akaike Information Criterion, a model selection criterion where it penalised for additional parameters included in the model. We would want a parsimonious model, hence a model with the lowest AICc would be of preference.
+
+<br>
+
+```{r}
+# Find other possible ETS models
+ets_models <- data %>% model(
+   ets_MAA = ETS(Turnover ~ error("M") + trend("A") + season("A")),
+    ets_MAM = ETS(Turnover ~ error("M") + trend("A") + season("M")),
+    ets_MAdM = ETS(Turnover ~ error("M") + trend("Ad") + season("M")),
+  ets_MAdA = ETS(Turnover ~ error("M") + trend("Ad") + season("A"))
+  )
+
+
+ets_models %>% glance() %>% arrange(AICc)
+```
+
+Here we choose three other possible models that is still quite consistent with the STL plot. Unsurprisingly, we have ETS(M,A,M) model with the lowest AICc, followed by ETS(M,Ad,M) model. This result is highly consistent with our assumptions.
+
+ETS(M,Ad,A) and ETS(M,A,A) both have AICcs that is far more larger. This result is predictable, as the seasonality in our data is hardly additive.
+
+The next step in determining the best model would be to do a cross-validation on the data.
+
+<br>
+
+```{r}
+# Cross Validation (Test)
+ets_cv <- data %>% 
+  stretch_tsibble(.init = 405, .step=1) %>% 
+  filter(.id < max(.id)) %>% model(
+     ets_MAA = ETS(Turnover ~ error("M") + trend("A") + season("A")),
+    ets_MAM = ETS(Turnover ~ error("M") + trend("A") + season("M")),
+    ets_MAdM = ETS(Turnover ~ error("M") + trend("Ad") + season("M")),
+  ets_MAdA = ETS(Turnover ~ error("M") + trend("Ad") + season("A"))
+  ) %>% forecast(h=1)
+ets_cv %>% accuracy(data)  %>% arrange(RMSE)
+```
+
+After the cross-validation, according to the RMSE, the ETS(M,Ad,M) model does better on the one step ahead cross-validated accuracy. The R-selected ETS(M,A,M) model still performs fairly well, while the other two latter models have much larger RMSEs.
+
+This having said, after considering the STL of the time-series, AICc of the model, and cross-validation RMSE; ETS(M,Ad,M) looks like a good fit for our data.
+
+
+### ARIMA
+
+As we have non-stationary data, we would need to do differencing on our data to make it more stationary. According to the unit-root test, we need to do first-order seasonal and ordinary differencing.
+
+We then do a first-order seasonal differencing, and do the unit-root test again to see if further ordinary differencing is needed. 
+
+```{r, warning=FALSE}
+# Making the data stationary
+# Seasonal only
+data_arima1 <- data %>% 
+  mutate(Diff_BC_Turnover = difference(BC_Turnover,12))
+
+# Do unit-root test for seasonal differenced series
+ndiffs1 <- unitroot_ndiffs(data_arima1$Diff_BC_Turnover)
+kable(ndiffs1)
+
+# Plotting ACF and PACF
+# For seasonal differencing only
+data_arima1 %>% gg_tsdisplay(Diff_BC_Turnover,lag_max = 48)
+```
+
+According to the unit-root test, we do not need to do further ordinary differencing. However, looking at the seasonal-differenced plot, we can see that it is still not quite stationary.
+
+If we do a further ordinary differencing on our seasonal-differenced data, we will have the following plot.
+
+```{r, warning=FALSE}
+# Making the data stationary by using differencing
+# Ordinary & Seasonal
+data_arima <- data %>% 
+  mutate(Diff_BC_Turnover = difference(difference(box_cox(Turnover,lambda_opt),12),1))
+
+# Plotting the ACF & PACF
+# For Seasonal & Ordinary differencing
+data_arima %>% gg_tsdisplay(Diff_BC_Turnover,lag_max=48)
+
+```
+
+Here we can see that the data is now more stationary. Both the ACF and PACF plot also suggest the same conclusion, meaning that this is the data we can use to work out our ARIMA model.
+
+From visual inspection of the ACF and PACF plot, the possible values for seasonal and non-seasonal AR(p) and MA(q) would be:
+
+Seasonal:
+P=0,Q=1
+
+Non-seasonal:
+p=1 or 2,q=0 or p=0,q=1
+
+Differencing:
+d=1, D=1 (from unit-root test)
+
+<br>
+
+```{r eval=FALSE}
+# Find the best ARIMA model 
+arima_best <- data_arima %>% model(ARIMA=ARIMA(box_cox(Turnover,lambda_opt), stepwise = FALSE, approximation = FALSE))
+```
+
+```{r}
+# Best ARIMA model (Training)
+arima <- data_arima %>% model(ARIMA=ARIMA(box_cox(Turnover,lambda_opt)))
+arima %>% report()
+```
+
+We now use an ARIMA model for our data. ARIMA stands for Autoregressive Integrated Moving Average, and the general model is ARIMA(p,d,q)(P,D,Q). The p and P in the model comes from the AR(p), which is the AR order, while the q and Q comes from the MA(q) term. (p,d,q) denotes the non-seasonal component of the data and (P,D,Q) denotes the seasonal component.
+
+Here, R reported that an ARIMA(1,0,1)(0,1,1) with drift model would best suit our data. This means that using a first-order seasonal differencing would help us obtain the best forecast for our data. This is quite consistent with our unit-root test result on how many differencing is needed for both seasonal and non-seasonal.
+
+To check if this model is indeed the best for our data, we will check other ARIMA models and compare their respective AICc.
+
+<br>
+
+```{r}
+# Other possible ARIMA models
+arima_models <- data %>% model(
+  arima_best = ARIMA(box_cox(Turnover,lambda_opt) ~ pdq(1,0,1)+PDQ(0,1,1)),
+    arima_best_nodrift = ARIMA(box_cox(Turnover,lambda_opt) ~ 0 + pdq(1,0,1)+PDQ(0,1,1)),
+    arima_011_011 = ARIMA(box_cox(Turnover,lambda_opt) ~ pdq(0,1,1)+PDQ(0,1,1)),
+    arima_111_011 = ARIMA(box_cox(Turnover,lambda_opt) ~ pdq(1,1,1)+PDQ(0,1,1)),
+   arima_201_011 = ARIMA(box_cox(Turnover,lambda_opt) ~ pdq(2,0,1)+PDQ(0,1,1))
+)
+
+arima_models %>% glance() %>% arrange(AICc)
+```
+
+Here we choose four other possible models that is still quite consistent with our visual inspection of the ACF and PACF plot, along with the unit-root test differencing result. Unsurprisingly, we have ARIMA(1,0,1)(0,1,1) with drift model with the lowest AICc, followed by ARIMA(0,1,1)(0,1,1) model. 
+
+ARIMA(2,0,1)(0,1,1), ARIMA(1,0,1)(0,1,1) without drift, and ARIMA(1,1,1)(0,1,1) have larger AICc, however it is not significantly larger. 
+
+The next step in determining the best model would be to do a cross-validation on the data.
+
+```{r}
+# Cross Validation (Test)
+arima_cv <- data %>%
+  stretch_tsibble(.init = 405, .step=1) %>% 
+  filter(.id < max(.id)) %>% model(
+  arima_best = ARIMA(box_cox(Turnover,lambda_opt) ~ pdq(1,0,1)+PDQ(0,1,1)),
+    arima_best_nodrift = ARIMA(box_cox(Turnover,lambda_opt) ~ 0 + pdq(1,0,1)+PDQ(0,1,1)),
+    arima_011_011 = ARIMA(box_cox(Turnover,lambda_opt) ~ pdq(0,1,1)+PDQ(0,1,1)),
+    arima_111_011 = ARIMA(box_cox(Turnover,lambda_opt) ~ pdq(1,1,1)+PDQ(0,1,1)),
+   arima_201_011 = ARIMA(box_cox(Turnover,lambda_opt) ~ pdq(2,0,1)+PDQ(0,1,1))
+  ) %>% forecast(h=1)
+arima_cv %>% accuracy(data) %>% arrange(RMSE) 
+```
+
+After the cross-validation, according to the RMSE, the ARIMA(1,0,1)(0,1,1) without drift model does better on the one step ahead cross-validated accuracy, compared to other four models including the "best" model reported by R. The R-selected ARIMA(1,0,1)(0,1,1) with drift model, however, still performs fairly well.
+
+This having said, after considering the AR(p) and MA(q) orders through visual inspection of ACF and PACF plots, AICc of the models, and cross-validation RMSEs; ARIMA(1,0,1)(0,1,1) without drift looks like a good fit for our data.
+
+<hr>
+
+## 4. MODEL ESTIMATION, DIAGNOSTICS, AND FORECASTS
+
+
+### ETS
+```{r}
+# ETS best model estimation
+ets_best_model <- data %>% model(
+  ets_MAdM = ETS(Turnover ~ error("M") + trend("Ad") + season("M")))
+
+report(ets_best_model)
+```
+
+This is the estimation for our best ETS model, where we have 4 smoothing parameters ($\alpha,\beta,\gamma,\phi$), 2 initial states, and 12 initial seasonalities.
+
+<br>
+
+```{r}
+# Creating Forecast
+ets_train <- data %>% filter(year(Month)<=2015)
+
+ets_fit <- ets_train %>% model(
+  ets_MAdM = ETS(Turnover ~ error("M") + trend("Ad") + season("M")))
+
+ets_fc <- ets_fit %>% forecast(h=24)
+
+ets_fc %>% autoplot(data %>% filter(year(Month)>2012),level=80)
+```
+
+Using the data prior to the year 2016 as our training set, we then produce a 2-year forecast. The point forecast looks quite similar to our actual data, and all our actual data falls within the 80% prediction interval.
+
+```{r}
+# Training set accuracy
+accuracy(ets_fit)
+
+# Test set accuracy
+accuracy(ets_fc,data)
+```
+
+Here we also report the accuracy of our training and test set. The training set has lower RMSE as we build the forecast model based on this set, while the test set has higher RMSE as the data in the test set might differ from the training set. 
+
+<br>
+
+```{r}
+# Residual
+ets_augment <- augment(ets_best_model) 
+ets_augment %>% gg_tsdisplay(.resid, plot_type = "histogram")
+ets_augment %>% ACF(.resid) %>% autoplot() + ggtitle("ACF Plot of ETS(M,Ad,M)")
+
+Box.test(ets_augment$.resid,lag=24,fitdf=17,type="Lj")
+```
+
+Here is the report on ETS(M,Ad,M) residuals. From the residual plot, we can visually say that it looks stationary, and from the histogram of residual, it looks normally distributed and have a mean of zero.
+
+All ACF plot bars fall within the blue-dashed line, showing that the residuals are not correlated and there is no leftover information in the residuals.
+
+These having said, by visual inspection we can say that the residual of our data is white noise.
+
+<br>
+
+To further check this fact, we do the Ljung-Box test, where:
+
+$H_0:$ Residuals are white noise
+
+$H_1:$ Residuals are not white noise
+
+Decision rule: Reject $H_0$ if p-value < $\alpha$
+
+Using 5% significance level, as p-value (0.001) < $\alpha=0.05$, we can reject the null hypothesis, meaning that according to the Ljung-Box test the residuals are not white noise.
+
+However, given the plots of residual, ACF, and histogram of residuals, we will just assume that the residuals are white noise.
+
+
+### ARIMA
+
+```{r}
+# ARIMA chosen model estimation
+arima_best_model <- data_arima %>% model(arima_best_nodrift = ARIMA(box_cox(Turnover,lambda_opt) ~ 0 + pdq(1,0,1)+PDQ(0,1,1)))
+arima_best_model %>% report()
+```
+
+This is the estimation for our chosen ARIMA model, where we have AR(p=1), MA(q=1), MA(Q=1), d=0, and D=1.
+
+<br>
+
+```{r}
+# Creating forecast
+arima_train <- data %>% filter(year(Month)<=2015)
+
+arima_fit <- arima_train %>% model(
+  arima_best_nodrift = ARIMA(box_cox(Turnover,lambda_opt) ~ 0 + pdq(1,0,1)+PDQ(0,1,1)))
+
+arima_fc <- arima_fit %>% forecast(h=24)
+
+arima_fc %>% autoplot(data %>% filter(year(Month)>2012),level=80)
+```
+
+Using the data prior to the year 2016 as our training set, we then produce a 2-year forecast. The point forecast looks quite similar to our actual data, and all our actual data falls within the 80% prediction interval.
+
+<br>
+
+```{r}
+# Training set accuracy
+accuracy(arima_fit)
+
+# Test set accuracy
+accuracy(arima_fc,data)
+```
+
+Here we also report the accuracy of our training and test set. The training set has lower RMSE as we build the forecast model based on this set, while the test set has higher RMSE as the data in the test set might differ from the training set. 
+
+<br>
+
+```{r}
+# Residual
+arima_best_model <- data %>% model(
+ arima_best_nodrift = ARIMA(box_cox(Turnover,lambda_opt) ~ 0 + pdq(1,0,1)+PDQ(0,1,1)))
+
+arima_augment <- augment(arima_best_model) 
+arima_augment %>% gg_tsdisplay(.resid, plot_type = "histogram")
+arima_augment %>% ACF(.resid) %>% autoplot() + ggtitle("ACF Plot of Best ARIMA")
+
+Box.test(arima_augment$.resid,lag=24,fitdf=3,type="Lj")
+```
+
+Here is the report on ARIMA(1,0,1)(0,1,1) without drift residuals. From the residual plot, we can visually say that it looks stationary, and from the histogram of residual, it looks normally distributed and have a mean of zero.
+
+All ACF plot bars significantly fall within the blue-dashed line, showing that the residuals are not correlated and there is no leftover information in the residuals.
+
+These having said, by visual inspection we can say that the residual of our data is white noise.
+
+<br>
+
+To further check this fact, we do the Ljung-Box test, where:
+
+$H_0:$ Residuals are white noise
+
+$H_1:$ Residuals are not white noise
+
+Decision rule: Reject $H_0$ if p-value < $\alpha$
+
+Using 5% significance level, as p-value (0.9863) > $\alpha=0.05$, we cannot reject the null hypothesis, meaning that according to the Ljung-Box test the residuals are white noise.
+
+This is consistent with our visual inspection.
+
+<hr>
+
+## 5. MODEL COMPARISON
+
+```{r}
+data_train <- data %>% filter(year(Month)<=2015)
+
+combine_fit <- data_train %>% model(
+   arima_best_nodrift = ARIMA(box_cox(Turnover,lambda_opt) ~ 0 + pdq(1,0,1)+PDQ(0,1,1)),
+    ets_MAdM = ETS(Turnover ~ error("M") + trend("Ad") + season("M"))
+   )
+
+combine_fc <- combine_fit %>% forecast(h=24)
+
+combine_fc %>% autoplot(data %>% filter(year(Month)>2014),level=80)+
+  ggtitle("2-Year Forecast using ETS vs ARIMA")
+
+# Training set accuracy
+accuracy(combine_fit)
+
+# Test set accuracy
+accuracy(combine_fc,data)
+```
+
+Here is a plot of both models alongside the actual data. Both ETS and ARIMA forecast fall within the 80% prediction interval, so we can conclude that both models is appropriate for forecasting our data.
+
+From visual inspection, in general ARIMA model gives us point forecasts that is closer to the actual data compared to ETS's point forecast. ARIMA model also have a relatively smaller 80% prediction interval.
+
+Moreover, ARIMA also gives us better RMSE in both the training and test data, hence concluding that for our current data ARIMA model might perform better than ETS.
+
+<hr>
+
+## 6. OUT-OF-SAMPLE POINT FORECAST & 80% PREDICTION INTERVAL
+
+### ETS
+```{r}
+ets_final <- data %>% model(
+  ets_MAdM = ETS(Turnover ~ error("M") + trend("Ad") + season("M")))
+
+ets_final_fc <- ets_final %>% forecast(h=24)
+
+ets_final_fc %>% autoplot(data %>% filter(year(Month)>2010), level=80)+ ggtitle("ABS ETS Forecast")
+```
+
+
+
+### ARIMA
+```{r}
+arima_final <- data %>% model(
+   arima_best_nodrift = ARIMA(box_cox(Turnover,lambda_opt) ~ 0 + pdq(1,0,1)+PDQ(0,1,1)))
+
+arima_final_fc <- arima_final %>% forecast(h=24)
+
+arima_final_fc %>% autoplot(data %>% filter(year(Month)>2010), level=80)+ggtitle("ABS ARIMA Forecast")
+```
+
+<hr>
+
+## 7. COMPARING THE FORECAST WITH ACTUAL DATA
+
+This is the time-series plot of our data up to the current month of March 2019.
+
+```{r}
+# Read ABS File
+
+newdata <- readxl::read_excel("8501011.xls", sheet=2, skip=9) %>%
+  transmute(
+Month = yearmonth(`Series ID`),
+    Turnover = A3349909T,
+    State = "Western Australia", 
+    Industry = "Hardware, building and garden supplies retailing"
+) %>% 
+  as_tsibble(key = c(State, Industry), index = Month)
+
+newdata <- newdata %>% select(-State,-Industry)
+
+# Plotting the ABS data
+newdata %>% autoplot(Turnover) + ggtitle("Up-To-Date ABS Data")
+```
+
+### ETS
+```{r, warning=FALSE}
+ets_new_train <- newdata %>% filter(year(Month)<=2017)
+
+ets_new_fit <- ets_new_train %>% model(
+  ets_MAdM = ETS(Turnover ~ error("M") + trend("Ad") + season("M")))
+
+ets_new_fc <- ets_new_fit %>% forecast(h=24)
+
+ets_new_fc %>% autoplot(newdata %>% filter(year(Month)>2012),level=80) + ggtitle("ETS Forecast vs Actual")
+
+```
+
+For our ETS model, all actual data actually fall within our 80% prediction interval. The future forecasts also looks reasonable. The model can capture movement pattern of the data well.
+
+### ARIMA
+
+```{r,warning=FALSE}
+arima_new_train <- newdata %>% filter(year(Month)<=2017)
+
+arima_new_fit <- arima_new_train %>% model(
+    arima_best_nodrift = ARIMA(box_cox(Turnover,lambda_opt) ~ 0 + pdq(1,0,1)+PDQ(0,1,1)))
+
+arima_new_fc <- arima_new_fit %>% forecast(h=24)
+
+arima_new_fc %>% autoplot(newdata %>% filter(year(Month)>2012)) +ggtitle("ARIMA Forecast vs Actual")
+
+```
+
+For our ARIMA model, all forecasts fall within the 95% prediction interval, whereas there are some point forecasts that does not fall within the 80% prediction interval. The model can capture movement pattern of the data well.
+
+### ETS VS ARIMA
+
+```{r}
+newdata_train <- newdata %>% filter(year(Month)<=2017)
+
+combine_new_fit <- newdata_train %>% model(
+   arima = ARIMA(box_cox(Turnover,lambda_opt) ~ pdq(1,0,1)+PDQ(0,1,1)),
+    ets_MAdM = ETS(Turnover ~ error("M") + trend("Ad") + season("M"))
+   )
+
+combine_new_fc <- combine_new_fit %>% forecast(h=24)
+
+combine_new_fc %>% autoplot(newdata %>% filter(year(Month)>2015))+ggtitle("ETS & ARIMA Forecast vs Actual")
+```
+
+As we can see from this combined plot of both ARIMA and ETS model, we can see that the ETS model works better on forecasting our actual data from ABS. This is quite surprising as in the previous test set using the last 2 years data prior to December 2017, the ARIMA model gives us better forecast and lower errors.
+
+For both model, overforecast of the data happens as the forecasted values are higher than the actual values. The forecast are only "accurate" for the first few months of 2018.
+
+<hr>
+
+## 8. BENEFITS AND LIMITATIONS
+
+### BENEFITS
+
+Looking at the forecasted value and the actual current data, we can say that overall the model can forecast our data well and that it captures most of movement pattern in the data.
+
+Using models that are adjusted to seasonality might helped us in coming up with quite a useful forecasting model, shown by the actual values actually falling within our prediction intervals.
+
+
+### LIMITATION
+
+Our out-of-sample forecast turned out to overforecast the actual data, implying that we might be able to find better models for both ETS and ARIMA. This is only not true for the first few point forecasts, where the forecasted value and actual data actually matches each other arguably well. This means that our model falls behind when we use it to forecast longer periods of data.
+
+For ARIMA model, as it gives worse forecast accuracy on the out-of-sample predictions, we might need to reconsider other differencing orders as well as determining another AR(p) and MA(q) orders.
+
+Lastly, a notable remark would be for our ETS model where it fails the Ljung-Box test, meaning that the residuals are not white noise. A consequence of this would be the possibility of residual correlation in the long run and us having wrong prediction intervals. However, when looking at the point forecasts, the forecasted value actually falls close to the actual values and it also capture the movement patterns well. Hence, despite everything, we might still be able to say that the ETS model is still reliable when used to forecast our data.   
